@@ -4,6 +4,20 @@ from pathlib import Path
 
 app = FastAPI(title="AI Maths Prep API")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="AI Maths Prep API")
+
+# Allow all origins for demo (you can restrict later)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # or put your Streamlit URL here later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 BASE_DIR = Path(__file__).resolve().parent
 TUTORIALS_DIR = BASE_DIR / "data" / "tutorials"
 if TUTORIALS_DIR.exists():
