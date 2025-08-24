@@ -8,6 +8,26 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="AI Maths Prep API")
 
+# 1) See exact file size on the server (Render)
+@app.get("/debug/file-info")
+def debug_file_info(subject: str, filename: str):
+    fpath = (TUTORIALS_DIR / subject / filename).resolve()
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail=f"Not found: {fpath}")
+    return {
+        "path": str(fpath),
+        "exists": True,
+        "size_bytes": fpath.stat().st_size,
+    }
+
+# 2) Force-serve the PDF via FileResponse (bypasses StaticFiles if needed)
+@app.get("/tutorials_file")
+def tutorials_file(subject: str, filename: str):
+    fpath = (TUTORIALS_DIR / subject / filename).resolve()
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail="File not found on server")
+    return FileResponse(path=fpath, media_type="application/pdf", filename=filename)
+
 # Allow all origins for demo (you can restrict later)
 app.add_middleware(
     CORSMiddleware,
