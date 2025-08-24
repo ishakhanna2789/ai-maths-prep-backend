@@ -1,0 +1,7 @@
+# Normalize line endings for text files
+*.py text
+*.txt text
+*.md text
+*.yaml text
+*.yml text
+*.gitignore text
