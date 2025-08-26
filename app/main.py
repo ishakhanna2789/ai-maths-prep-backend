@@ -7,6 +7,11 @@ app = FastAPI(title="AI Maths Prep API")
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="AI Maths Prep API")
+from fastapi.staticfiles import StaticFiles  # add with imports
+
+# mount your existing folder:
+app.mount("/static/tutorials", StaticFiles(directory="app/data/tutorials"), name="tutorials")
+
 
 # 1) See exact file size on the server (Render)
 @app.get("/debug/file-info")
