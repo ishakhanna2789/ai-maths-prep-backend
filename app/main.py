@@ -86,6 +86,20 @@ class QuizManager:
         self.cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
         self.sessions: Dict[str, Dict[str, Any]] = {}
 
+    def _topic_keys(self, topic: str):
+        """
+        Returns (slug_without_ext, code) from topic string.
+        topic may be '1.1_Intro_to_Vectors', '1.1_Intro_to_Vectors.pdf', or just '1.1'.
+        """
+        t = str(topic).strip().split("/")[-1]
+        # drop .pdf if present
+        if t.lower().endswith(".pdf"):
+            t = t[:-4]
+        slug = t  # e.g., '1.1_Intro_to_Vectors' or '1.1'
+        m = re.search(r"(\d+)\.(\d+)", t)
+        code = f"{int(m.group(1))}.{int(m.group(2))}" if m else slug
+        return slug, code
+
     # -------- loading/helpers --------
     def _xlsx_path(self, subject: str) -> Path:
         s = subject.strip()
@@ -93,15 +107,11 @@ class QuizManager:
             raise ValueError("Invalid subject (use 'LA' or 'Stats')")
         return QUIZ_DIR / f"{s}.xlsx"
 
+        # (intentionally unused now; kept if you referenced elsewhere)
     def _sheet_key_from_topic(self, topic: str) -> str:
-        # e.g., "1.1_Intro_to_Vectors" -> "1.1"
-        m = re.search(r"(\d+)\.(\d+)", str(topic))
-        if m:
-            return f"{int(m.group(1))}.{int(m.group(2))}"
-        m2 = re.search(r"(\d+)", str(topic))
-        if m2:
-            return str(int(m2.group(1)))
-        raise ValueError("Cannot infer sheet key from topic")
+        slug, code = self._topic_keys(topic)
+        return code
+
 
     def _idx_from_correct(self, raw: Any, options: List[str]) -> int:
         # Accept 0–3, A–D, or exact option text
@@ -120,10 +130,116 @@ class QuizManager:
                 return i
         return 0
 
-    def _load_sheet(self, subject: str, sheet_key: str) -> List[Dict[str, Any]]:
+        def _load_sheet(self, subject: str, slug: str, code: str) -> List[Dict[str, Any]]:
+        """
+        Load questions from Excel. Accept sheets named exactly like:
+          - slug: '1.1_Intro_to_Vectors'
+          - code: '1.1'
+        Or sheets that start with / contain either.
+        """
         subj_cache = self.cache.setdefault(subject, {})
-        if sheet_key in subj_cache:
-            return subj_cache[sheet_key]
+        cache_key = f"{slug}||{code}"
+        if cache_key in subj_cache:
+            return subj_cache[cache_key]
+
+        xlsx = self._xlsx_path(subject)
+        if not xlsx.exists():
+            raise FileNotFoundError(f"Quiz workbook missing: {xlsx}")
+
+        wb = load_workbook(filename=str(xlsx), read_only=True, data_only=True)
+
+        # ---- resolve sheet name: exact -> prefix -> contains (case-insensitive) ----
+        slug_l = slug.lower()
+        code_l = code.lower()
+        name = None
+
+        # exact
+        if slug in wb.sheetnames:
+            name = slug
+        elif code in wb.sheetnames:
+            name = code
+        else:
+            # prefix
+            for s in wb.sheetnames:
+                sl = s.strip().lower()
+                if sl.startswith(slug_l) or sl.startswith(code_l):
+                    name = s
+                    break
+            # contains
+            if not name:
+                for s in wb.sheetnames:
+                    sl = s.strip().lower()
+                    if slug_l in sl or code_l in sl:
+                        name = s
+                        break
+
+        if not name:
+            wb.close()
+            raise FileNotFoundError(f"Sheet not found for topic '{slug}' or code '{code}' in {xlsx.name}")
+
+        ws = wb[name]
+
+        # Header
+        header = [str(c).strip().lower() if c else "" for c in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))]
+        col = {h: i for i, h in enumerate(header)}
+
+        def cell(row, name):
+            i = col.get(name)
+            return row[i] if i is not None and i < len(row) else None
+
+        required = ["question text", "option a", "option b", "option c", "option d", "correct answer", "difficulty"]
+        miss = [r for r in required if r not in col]
+        if miss:
+            wb.close()
+            raise ValueError(f"Missing columns {miss} in sheet '{name}' of {xlsx.name}")
+
+        # Optional columns
+        optional_names = {
+            "hint": "hint",
+            "explanation": "explanation",
+            "image_url": "image link (optional)",
+            "qid": "question id",
+            "module": "module",
+            "tags": "tags",
+            "type": "question type",
+        }
+
+        items: List[Dict[str, Any]] = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            qtext = cell(row, "question text")
+            if qtext is None or str(qtext).strip() == "":
+                continue
+            options = [
+                "" if cell(row, "option a") is None else str(cell(row, "option a")),
+                "" if cell(row, "option b") is None else str(cell(row, "option b")),
+                "" if cell(row, "option c") is None else str(cell(row, "option c")),
+                "" if cell(row, "option d") is None else str(cell(row, "option d")),
+            ]
+            correct = self._idx_from_correct(cell(row, "correct answer"), options)
+
+            diff_raw = str(cell(row, "difficulty") or "").strip().lower()
+            if diff_raw.startswith("e"):   diff = "easy"
+            elif diff_raw.startswith("m"): diff = "medium"
+            elif diff_raw.startswith("h"): diff = "hard"
+            else:                          diff = "medium"
+
+            item = {"text": str(qtext), "options": options, "correct_index": correct, "difficulty": diff}
+
+            for k, header_name in optional_names.items():
+                j = col.get(header_name)
+                if j is not None and j < len(row) and row[j] is not None:
+                    item[k] = str(row[j])
+
+            items.append(item)
+
+        wb.close()
+
+        if not items:
+            raise ValueError(f"No questions in sheet '{name}' of {xlsx.name}")
+
+        subj_cache[cache_key] = items
+        return items
+
 
         xlsx = self._xlsx_path(subject)
         if not xlsx.exists():
@@ -241,8 +357,10 @@ class QuizManager:
 
     # -------- public API --------
     def start(self, subject: str, topic: str) -> Dict[str, Any]:
-        sheet_key = self._sheet_key_from_topic(topic)
-        all_items = self._load_sheet(subject, sheet_key)
+        slug, code = self._topic_keys(topic)
+        all_items = self._load_sheet(subject, slug, code)
+
+        #all_items = self._load_sheet(subject, sheet_key)
         pools = self._split_pools(all_items)
 
         # Phase 1: 5 questions from Easy/Medium only
