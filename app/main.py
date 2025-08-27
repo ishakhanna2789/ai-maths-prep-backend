@@ -130,13 +130,7 @@ class QuizManager:
                 return i
         return 0
 
-        def _load_sheet(self, subject: str, slug: str, code: str) -> List[Dict[str, Any]]:
-        """
-        Load questions from Excel. Accept sheets named exactly like:
-          - slug: '1.1_Intro_to_Vectors'
-          - code: '1.1'
-        Or sheets that start with / contain either.
-        """
+    def _load_sheet(self, subject: str, slug: str, code: str) -> List[Dict[str, Any]]:
         subj_cache = self.cache.setdefault(subject, {})
         cache_key = f"{slug}||{code}"
         if cache_key in subj_cache:
