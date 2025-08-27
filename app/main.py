@@ -6,6 +6,8 @@ import pandas as pd
 from typing import Dict, List, Any
 from fastapi import Body
 import uuid
+from fastapi.staticfiles import StaticFiles
+
 
 
 app = FastAPI(title="AI Maths Prep API")
