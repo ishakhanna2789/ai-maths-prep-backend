@@ -1,17 +1,20 @@
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+
 from typing import Dict, List, Any, Optional
 from pathlib import Path
-import uuid, re, random
+import random, re, uuid
+
 from openpyxl import load_workbook
 
-# -------------------------------------------------------------------
+
+# =============================================================================
 # App setup
-# -------------------------------------------------------------------
+# =============================================================================
 app = FastAPI(title="AI Maths Prep API", version="0.1.0")
 
-# Allow frontend calls (relax for dev; restrict in prod)
+# CORS (open for dev; restrict in production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,101 +23,111 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Paths
-BASE_DIR = Path(__file__).parent
-TUTORIALS_DIR = BASE_DIR / "data" / "tutorials"
-QUIZ_DIR = BASE_DIR / "data" / "quizzes"
+# Data roots (relative to this file)
+APP_DIR = Path(__file__).parent
+TUTORIALS_DIR = APP_DIR / "data" / "tutorials"
+QUIZZES_DIR   = APP_DIR / "data" / "quizzes"
 
-# Serve PDFs statically
+# Serve tutorials as static files (so Streamlit can embed PDFs reliably)
 app.mount("/static/tutorials", StaticFiles(directory=str(TUTORIALS_DIR)), name="tutorials")
 
-# -------------------------------------------------------------------
-# Healthcheck
-# -------------------------------------------------------------------
+
+# =============================================================================
+# Health check
+# =============================================================================
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
 
-# -------------------------------------------------------------------
-# Tutorials endpoints
-# -------------------------------------------------------------------
+
+# =============================================================================
+# Tutorials
+# =============================================================================
 @app.get("/tutorials_list")
 def tutorials_list(subject: str):
     """
-    Return a list of tutorial PDFs for subject (LA or Stats).
+    Return list of tutorial PDFs for the given subject ("LA" or "Stats").
+    Response: [{ "filename": "...pdf", "title": "1.1 Intro to ..."}]
     """
+    subject = subject.strip()
     subject_dir = TUTORIALS_DIR / subject
-    if not subject_dir.exists():
-        raise HTTPException(status_code=404, detail="Subject not found")
-    files = sorted([f.name for f in subject_dir.glob("*.pdf")])
-    # Minimal payload; frontend computes titles, sorting, locking.
-    return files
+    if not subject_dir.exists() or not subject_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"Subject not found: {subject}")
+
+    files = sorted([p.name for p in subject_dir.glob("*.pdf")])
+    items: List[Dict[str, Any]] = []
+    for name in files:
+        title = name[:-4].replace("_", " ").replace("-", " ").strip()  # drop .pdf
+        items.append({"filename": name, "title": title, "subject": subject})
+    return items
+
 
 @app.get("/tutorials_file")
 def tutorials_file(subject: str, filename: str):
     """
-    Return a URL for the tutorial file (static mount).
+    Return a JSON object with a public URL to the tutorial file.
+    The frontend will embed this, and also has a static fallback.
     """
     subject_dir = TUTORIALS_DIR / subject
-    fpath = subject_dir / filename
-    if not fpath.exists():
+    file_path = subject_dir / filename
+    if not file_path.exists():
         raise HTTPException(status_code=404, detail="Tutorial file not found")
+    # Return a relative API URL (frontend can prefix with API_BASE_URL)
     return {"url": f"/static/tutorials/{subject}/{filename}"}
 
-# -------------------------------------------------------------------
-# Quiz engine (Excel-backed via openpyxl) implementing your logic
-# -------------------------------------------------------------------
+
+# =============================================================================
+# Quiz Engine (Excel-backed via openpyxl, adaptive)
+# =============================================================================
 class QuizManager:
     """
-    Phase 1 (Q1–Q5): choose only Easy/Medium.
-      - If correct >= 3/5  -> unlock next, end (status "Ready for next"), unless it's a perfect 5/5.
-      - If perfect 5/5     -> unlock next and continue to Phase 2 seamlessly.
+    Adaptive quiz logic:
 
-    Phase 2 (Q6–Q8) — only if perfect 5/5:
-      Q6 difficulty = Hard
-      Q7 difficulty = Hard if Q6 correct else Medium
-      Q8 difficulty = Hard if Q7 correct else Easy
+    Phase 1 (Q1–Q5): draw 5 questions from Easy/Medium only (column 'Difficulty').
+      - If correct >= 3 -> unlock_next = True and finish with status "Ready for next".
+      - If correct == 5 -> unlock_next = True and seamlessly continue to Phase 2.
 
-    Final statuses:
-      5/6 -> Confident
-      6/7 -> Proficient
-      7/8 -> Master
-      8/8 -> Champion
+    Phase 2 (Q6–Q8): only when Phase 1 is perfect (5/5)
+      - Q6 difficulty = Hard
+      - Q7 difficulty = Hard if Q6 correct else Medium
+      - Q8 difficulty = Hard if Q7 correct else Easy
+
+    Final statuses (when 6–8 asked):
+      - 5/6 -> "Confident"
+      - 6/7 -> "Proficient"
+      - 7/8 -> "Master"
+      - 8/8 -> "Champion"
     """
 
     def __init__(self) -> None:
+        # cache[subject][sheet_key] -> list of question dicts
         self.cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        # sessions[session_id] -> session state
         self.sessions: Dict[str, Dict[str, Any]] = {}
 
-    def _topic_keys(self, topic: str):
-        """
-        Returns (slug_without_ext, code) from topic string.
-        topic may be '1.1_Intro_to_Vectors', '1.1_Intro_to_Vectors.pdf', or just '1.1'.
-        """
-        t = str(topic).strip().split("/")[-1]
-        # drop .pdf if present
-        if t.lower().endswith(".pdf"):
-            t = t[:-4]
-        slug = t  # e.g., '1.1_Intro_to_Vectors' or '1.1'
-        m = re.search(r"(\d+)\.(\d+)", t)
-        code = f"{int(m.group(1))}.{int(m.group(2))}" if m else slug
-        return slug, code
-
-    # -------- loading/helpers --------
+    # ----------------- Loading helpers -----------------
     def _xlsx_path(self, subject: str) -> Path:
         s = subject.strip()
         if s not in {"LA", "Stats"}:
             raise ValueError("Invalid subject (use 'LA' or 'Stats')")
-        return QUIZ_DIR / f"{s}.xlsx"
+        return QUIZZES_DIR / f"{s}.xlsx"
 
-        # (intentionally unused now; kept if you referenced elsewhere)
     def _sheet_key_from_topic(self, topic: str) -> str:
-        slug, code = self._topic_keys(topic)
-        return code
-
+        """
+        Extract the sheet key (e.g., '1.1') from a topic like '1.1_Intro_to_Vectors'.
+        """
+        m = re.search(r"(\d+)\.(\d+)", str(topic))
+        if m:
+            return f"{int(m.group(1))}.{int(m.group(2))}"
+        m2 = re.search(r"(\d+)", str(topic))
+        if m2:
+            return str(int(m2.group(1)))
+        raise ValueError("Cannot infer sheet key from topic")
 
     def _idx_from_correct(self, raw: Any, options: List[str]) -> int:
-        # Accept 0–3, A–D, or exact option text
+        """
+        Accept 'A'/'B'/'C'/'D' (case-insensitive), 0..3, or exact option text.
+        """
         if raw is None:
             return 0
         s = str(raw).strip()
@@ -122,143 +135,62 @@ class QuizManager:
             i = int(s)
             if 0 <= i <= 3:
                 return i
-        letter = {"A":0, "B":1, "C":2, "D":3}.get(s.upper())
-        if letter is not None:
-            return letter
+        letter_map = {"A": 0, "B": 1, "C": 2, "D": 3}
+        if s.upper() in letter_map:
+            return letter_map[s.upper()]
         for i, opt in enumerate(options):
             if s == opt:
                 return i
         return 0
 
-    def _load_sheet(self, subject: str, slug: str, code: str) -> List[Dict[str, Any]]:
+    def _load_sheet(self, subject: str, sheet_key: str) -> List[Dict[str, Any]]:
+        """
+        Read a sheet using openpyxl.
+        Required headers (case-insensitive):
+            Question Text | Option A | Option B | Option C | Option D | Correct Answer | Difficulty
+        Optional:
+            Module | Question ID | Question Type | Hint | Explanation | Tags | Image Link (optional)
+        """
         subj_cache = self.cache.setdefault(subject, {})
-        cache_key = f"{slug}||{code}"
-        if cache_key in subj_cache:
-            return subj_cache[cache_key]
+        if sheet_key in subj_cache:
+            return subj_cache[sheet_key]
 
         xlsx = self._xlsx_path(subject)
         if not xlsx.exists():
             raise FileNotFoundError(f"Quiz workbook missing: {xlsx}")
 
-        wb = load_workbook(filename=str(xlsx), read_only=True, data_only=True)
+        try:
+            wb = load_workbook(filename=str(xlsx), read_only=True, data_only=True)
+        except Exception as e:
+            raise FileNotFoundError(f"Cannot open workbook {xlsx.name}: {e}")
 
-        # ---- resolve sheet name: exact -> prefix -> contains (case-insensitive) ----
-        slug_l = slug.lower()
-        code_l = code.lower()
-        name = None
-
-        # exact
-        if slug in wb.sheetnames:
-            name = slug
-        elif code in wb.sheetnames:
-            name = code
-        else:
-            # prefix
-            for s in wb.sheetnames:
-                sl = s.strip().lower()
-                if sl.startswith(slug_l) or sl.startswith(code_l):
-                    name = s
-                    break
-            # contains
-            if not name:
-                for s in wb.sheetnames:
-                    sl = s.strip().lower()
-                    if slug_l in sl or code_l in sl:
-                        name = s
-                        break
-
-        if not name:
-            wb.close()
-            raise FileNotFoundError(f"Sheet not found for topic '{slug}' or code '{code}' in {xlsx.name}")
-
-        ws = wb[name]
-
-        # Header
-        header = [str(c).strip().lower() if c else "" for c in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))]
-        col = {h: i for i, h in enumerate(header)}
-
-        def cell(row, name):
-            i = col.get(name)
-            return row[i] if i is not None and i < len(row) else None
-
-        required = ["question text", "option a", "option b", "option c", "option d", "correct answer", "difficulty"]
-        miss = [r for r in required if r not in col]
-        if miss:
-            wb.close()
-            raise ValueError(f"Missing columns {miss} in sheet '{name}' of {xlsx.name}")
-
-        # Optional columns
-        optional_names = {
-            "hint": "hint",
-            "explanation": "explanation",
-            "image_url": "image link (optional)",
-            "qid": "question id",
-            "module": "module",
-            "tags": "tags",
-            "type": "question type",
-        }
-
-        items: List[Dict[str, Any]] = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            qtext = cell(row, "question text")
-            if qtext is None or str(qtext).strip() == "":
-                continue
-            options = [
-                "" if cell(row, "option a") is None else str(cell(row, "option a")),
-                "" if cell(row, "option b") is None else str(cell(row, "option b")),
-                "" if cell(row, "option c") is None else str(cell(row, "option c")),
-                "" if cell(row, "option d") is None else str(cell(row, "option d")),
-            ]
-            correct = self._idx_from_correct(cell(row, "correct answer"), options)
-
-            diff_raw = str(cell(row, "difficulty") or "").strip().lower()
-            if diff_raw.startswith("e"):   diff = "easy"
-            elif diff_raw.startswith("m"): diff = "medium"
-            elif diff_raw.startswith("h"): diff = "hard"
-            else:                          diff = "medium"
-
-            item = {"text": str(qtext), "options": options, "correct_index": correct, "difficulty": diff}
-
-            for k, header_name in optional_names.items():
-                j = col.get(header_name)
-                if j is not None and j < len(row) and row[j] is not None:
-                    item[k] = str(row[j])
-
-            items.append(item)
-
-        wb.close()
-
-        if not items:
-            raise ValueError(f"No questions in sheet '{name}' of {xlsx.name}")
-
-        subj_cache[cache_key] = items
-        return items
-
-
-        xlsx = self._xlsx_path(subject)
-        if not xlsx.exists():
-            raise FileNotFoundError(f"Quiz workbook missing: {xlsx}")
-
-        wb = load_workbook(filename=str(xlsx), read_only=True, data_only=True)
         if sheet_key not in wb.sheetnames:
+            wb.close()
             raise FileNotFoundError(f"Sheet '{sheet_key}' missing in {xlsx.name}")
+
         ws = wb[sheet_key]
 
-        # Header
-        header = [str(c).strip().lower() if c else "" for c in next(ws.iter_rows(min_row=1, max_row=1, values_only=True))]
-        col = {h: i for i, h in enumerate(header)}
+        # Header row
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not header_row:
+            wb.close()
+            raise ValueError(f"No header in sheet '{sheet_key}' of {xlsx.name}")
 
-        def cell(row, name):
-            i = col.get(name)
-            return row[i] if i is not None and i < len(row) else None
+        headers = [str(c).strip().lower() if c is not None else "" for c in header_row]
+        col_index = {h: i for i, h in enumerate(headers)}
 
-        required = ["question text", "option a", "option b", "option c", "option d", "correct answer", "difficulty"]
-        miss = [r for r in required if r not in col]
-        if miss:
-            raise ValueError(f"Missing columns {miss} in sheet '{sheet_key}' of {xlsx.name}")
+        # Validate required columns
+        required = [
+            "question text", "option a", "option b", "option c",
+            "option d", "correct answer", "difficulty"
+        ]
+        missing = [c for c in required if c not in col_index]
+        if missing:
+            wb.close()
+            raise ValueError(f"Missing columns {missing} in sheet '{sheet_key}' of {xlsx.name}")
 
-        # Optional columns (not required by the UI but supported)
-        optional_names = {
+        # Optional columns map
+        optional_map = {
             "hint": "hint",
             "explanation": "explanation",
             "image_url": "image link (optional)",
@@ -268,32 +200,47 @@ class QuizManager:
             "type": "question type",
         }
 
+        # Rows -> questions
         items: List[Dict[str, Any]] = []
         for row in ws.iter_rows(min_row=2, values_only=True):
-            qtext = cell(row, "question text")
+            def cell(col_name: str) -> Any:
+                i = col_index.get(col_name)
+                return row[i] if i is not None and i < len(row) else None
+
+            qtext = cell("question text")
             if qtext is None or str(qtext).strip() == "":
-                continue
+                continue  # skip empty rows
+
             options = [
-                "" if cell(row, "option a") is None else str(cell(row, "option a")),
-                "" if cell(row, "option b") is None else str(cell(row, "option b")),
-                "" if cell(row, "option c") is None else str(cell(row, "option c")),
-                "" if cell(row, "option d") is None else str(cell(row, "option d")),
+                "" if cell("option a") is None else str(cell("option a")),
+                "" if cell("option b") is None else str(cell("option b")),
+                "" if cell("option c") is None else str(cell("option c")),
+                "" if cell("option d") is None else str(cell("option d")),
             ]
-            correct = self._idx_from_correct(cell(row, "correct answer"), options)
+            correct = self._idx_from_correct(cell("correct answer"), options)
 
-            diff_raw = str(cell(row, "difficulty") or "").strip().lower()
-            if diff_raw.startswith("e"):   diff = "easy"
-            elif diff_raw.startswith("m"): diff = "medium"
-            elif diff_raw.startswith("h"): diff = "hard"
-            else:                          diff = "medium"
+            diff_raw = str(cell("difficulty") or "").strip().lower()
+            if diff_raw.startswith("e"):
+                diff = "easy"
+            elif diff_raw.startswith("m"):
+                diff = "medium"
+            elif diff_raw.startswith("h"):
+                diff = "hard"
+            else:
+                diff = "medium"
 
-            item = {"text": str(qtext), "options": options, "correct_index": correct, "difficulty": diff}
+            item: Dict[str, Any] = {
+                "text": str(qtext),
+                "options": options,
+                "correct_index": correct,
+                "difficulty": diff,
+            }
 
             # Attach optional metadata if present
-            for k, header_name in optional_names.items():
-                j = col.get(header_name)
-                if j is not None and j < len(row) and row[j] is not None:
-                    item[k] = str(row[j])
+            for k, col_name in optional_map.items():
+                i = col_index.get(col_name)
+                if i is not None and i < len(row) and row[i] is not None:
+                    item[k] = str(row[i])
 
             items.append(item)
 
@@ -305,7 +252,7 @@ class QuizManager:
         subj_cache[sheet_key] = items
         return items
 
-    # -------- pool helpers --------
+    # ----------------- Pool & selection helpers -----------------
     def _split_pools(self, items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
         pools = {"easy": [], "medium": [], "hard": []}
         for it in items:
@@ -313,51 +260,37 @@ class QuizManager:
         return pools
 
     def _draw(self, pool: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
-        if k <= 0: return []
+        if k <= 0:
+            return []
         if len(pool) <= k:
             return random.sample(pool, len(pool)) if pool else []
         return random.sample(pool, k)
 
     def _fallback_take(self, pools: Dict[str, List[Dict[str, Any]]], wanted: List[str], k: int) -> List[Dict[str, Any]]:
+        """
+        Take up to k from pools in order of 'wanted' difficulties; if short, fill from any available.
+        """
         chosen: List[Dict[str, Any]] = []
         for name in wanted:
             take = min(k - len(chosen), len(pools.get(name, [])))
             if take > 0:
                 chosen.extend(self._draw(pools[name], take))
         if len(chosen) < k:
-            all_pool = [x for name, arr in pools.items() for x in arr if x not in chosen]
+            # Fill from all (avoid duplicates)
+            all_pool = [x for arr in pools.values() for x in arr if x not in chosen]
             chosen.extend(self._draw(all_pool, k - len(chosen)))
         return chosen[:k]
 
-    def _select_adaptive(self, pools: Dict[str, List[Dict[str, Any]]], q6_correct: bool, q7_correct: Optional[bool]) -> List[Dict[str, Any]]:
-        """
-        Build Q6–Q8 difficulties per your rules, with safe fallbacks if a pool is short.
-        """
-        seq: List[str] = []
-        seq.append("hard")                                        # Q6
-        seq.append("hard" if q6_correct else "medium")            # Q7
-        seq.append("hard" if (q7_correct is True) else ("easy" if (q7_correct is False) else "medium"))  # Q8
-
-        chosen: List[Dict[str, Any]] = []
-        for want in seq:
-            order = {"hard": ["hard", "medium", "easy"], "medium": ["medium", "easy", "hard"], "easy": ["easy", "medium", "hard"]}[want]
-            pick = self._fallback_take(pools, order, 1)
-            if pick:
-                ids = set(id(x) for x in chosen)  # avoid duplicates
-                p = next((x for x in pick if id(x) not in ids), None)
-                if p is not None:
-                    chosen.append(p)
-        return chosen
-
-    # -------- public API --------
+    # ----------------- Public API -----------------
     def start(self, subject: str, topic: str) -> Dict[str, Any]:
-        slug, code = self._topic_keys(topic)
-        all_items = self._load_sheet(subject, slug, code)
-
-        #all_items = self._load_sheet(subject, sheet_key)
+        """
+        Initialize a session with 5 questions (Easy/Medium). If perfect 5/5,
+        the session will continue into adaptive Phase 2 (Q6–Q8).
+        """
+        sheet_key = self._sheet_key_from_topic(topic)
+        all_items = self._load_sheet(subject, sheet_key)
         pools = self._split_pools(all_items)
 
-        # Phase 1: 5 questions from Easy/Medium only
         first5 = self._fallback_take(pools, ["easy", "medium"], 5)
         if not first5:
             raise ValueError("No questions available for Phase 1")
@@ -367,17 +300,17 @@ class QuizManager:
             "subject": subject,
             "topic": topic,
             "sheet_key": sheet_key,
-            "phase": 1,
-            "index": 0,
+            "phase": 1,           # 1 or 2
+            "index": 0,           # index within current phase
             "first5": first5,
             "first5_correct": 0,
             "pools": pools,
-            "q6_result": None,
-            "q7_result": None,
-            "adaptive": [],
             "score": 0,
             "asked": 0,
-            "unlock_next": False,
+            "unlock_next": False, # set True if >=3/5 in Phase 1
+            "q6_result": None,    # set in Phase 2
+            "q7_result": None,    # set in Phase 2
+            "adaptive": [],       # questions for Phase 2
         }
 
         q = first5[0]
@@ -387,12 +320,39 @@ class QuizManager:
             "done": False,
         }
 
+    def _select_adaptive_seq(self, pools: Dict[str, List[Dict[str, Any]]], q6_correct: bool, q7_correct: Optional[bool]) -> List[Dict[str, Any]]:
+        """
+        Build the desired sequence Q6..Q8 with the specified branching rules,
+        using safe fallbacks if a difficulty pool is short.
+        """
+        desired = [
+            "hard",                                   # Q6
+            "hard" if q6_correct else "medium",       # Q7
+            "hard" if (q7_correct is True) else ("easy" if (q7_correct is False) else "medium"),  # Q8
+        ]
+
+        chosen: List[Dict[str, Any]] = []
+        for want in desired:
+            order = {
+                "hard":   ["hard", "medium", "easy"],
+                "medium": ["medium", "easy", "hard"],
+                "easy":   ["easy", "medium", "hard"],
+            }[want]
+            pick = self._fallback_take(pools, order, 1)
+            if pick:
+                # avoid duplicates across adaptive picks
+                ids = set(id(x) for x in chosen)
+                p = next((x for x in pick if id(x) not in ids), None)
+                if p is not None:
+                    chosen.append(p)
+        return chosen
+
     def answer(self, session_id: str, answer_index: int) -> Dict[str, Any]:
         sess = self.sessions.get(session_id)
         if not sess:
             raise ValueError("Invalid session_id")
 
-        # ---------- Phase 1 ----------
+        # ---------------- Phase 1 ----------------
         if sess["phase"] == 1:
             i = sess["index"]
             curr = sess["first5"][i]
@@ -403,6 +363,7 @@ class QuizManager:
             sess["asked"] += 1
 
             if i < 4:
+                # Next question within Phase 1
                 sess["index"] += 1
                 nxt = sess["first5"][sess["index"]]
                 return {
@@ -411,12 +372,12 @@ class QuizManager:
                     "question": {"text": nxt["text"], "options": nxt["options"], "difficulty": nxt["difficulty"]},
                 }
 
-            # i == 4 -> finished first 5
+            # Completed first 5
             passed = (sess["first5_correct"] >= 3)
             sess["unlock_next"] = passed
 
             if sess["first5_correct"] < 5:
-                # End now: either Ready for next (>=3/5) or Review & retry (<3/5)
+                # End here (not perfect): show "Ready for next" if passed
                 return {
                     "correct": correct,
                     "done": True,
@@ -426,11 +387,11 @@ class QuizManager:
                     "status": "Ready for next" if passed else "Review & retry",
                 }
 
-            # Perfect 5/5 -> continue to Phase 2
+            # Perfect 5 → continue to Phase 2 (adaptive)
             pools = sess["pools"]
-            adaptive = self._select_adaptive(pools, q6_correct=True, q7_correct=None)
+            adaptive = self._select_adaptive_seq(pools, q6_correct=True, q7_correct=None)
             if not adaptive:
-                # No adaptive questions available; finish gracefully
+                # If somehow nothing available, still end gracefully
                 return {
                     "correct": correct,
                     "done": True,
@@ -441,8 +402,8 @@ class QuizManager:
                 }
 
             sess["phase"] = 2
-            sess["adaptive"] = adaptive
             sess["index"] = 0
+            sess["adaptive"] = adaptive
             nxt = adaptive[0]  # Q6
             return {
                 "correct": correct,
@@ -450,7 +411,7 @@ class QuizManager:
                 "question": {"text": nxt["text"], "options": nxt["options"], "difficulty": nxt.get("difficulty", "hard")},
             }
 
-        # ---------- Phase 2 ----------
+        # ---------------- Phase 2 ----------------
         i = sess["index"]
         curr = sess["adaptive"][i]
         correct = (int(answer_index) == int(curr["correct_index"]))
@@ -459,11 +420,12 @@ class QuizManager:
         sess["asked"] += 1
 
         if i == 0:
-            # After Q6 -> pick Q7 based on Q6 result
+            # After Q6 → decide Q7 difficulty
             sess["q6_result"] = correct
             pools = sess["pools"]
-            rem = self._select_adaptive(pools, q6_correct=correct, q7_correct=None)
-            sess["adaptive"] = rem[:2] if len(rem) >= 2 else rem  # Q7, Q8 candidates
+            rem = self._select_adaptive_seq(pools, q6_correct=correct, q7_correct=None)
+            # Keep the next 2 (Q7, Q8)
+            sess["adaptive"] = rem[:2] if len(rem) >= 2 else rem
             sess["index"] = 0
             if sess["adaptive"]:
                 nxt = sess["adaptive"][0]  # Q7
@@ -474,11 +436,11 @@ class QuizManager:
                 }
             return self._finish(sess, correct)
 
-        elif i == 1:
-            # After Q7 -> pick Q8 based on Q7 result
+        if i == 1:
+            # After Q7 → decide Q8 difficulty
             sess["q7_result"] = correct
             pools = sess["pools"]
-            q8 = self._select_adaptive(pools, q6_correct=bool(sess["q6_result"]), q7_correct=correct)
+            q8 = self._select_adaptive_seq(pools, q6_correct=bool(sess["q6_result"]), q7_correct=correct)
             sess["adaptive"] = q8[:1] if q8 else []
             sess["index"] = 0
             if sess["adaptive"]:
@@ -490,19 +452,19 @@ class QuizManager:
                 }
             return self._finish(sess, correct)
 
-        else:
-            # After Q8 -> finish
-            return self._finish(sess, correct)
+        # i == 0 for final Q8 (due to resets above)
+        return self._finish(sess, correct)
 
     def _finish(self, sess: Dict[str, Any], last_correct: bool) -> Dict[str, Any]:
         total = sess["asked"]
         score = sess["score"]
-        # If we reached Phase 2 we already unlocked; otherwise use unlock_next set after Phase 1.
-        unlock = sess.get("unlock_next", False) or (sess.get("phase") == 2)
+        # If we reached Phase 2, unlock_next is inherently True (Phase 1 was perfect)
+        unlock = sess.get("unlock_next", False) or True
 
-        # Status mapping for extended rounds
+        # Status decisions when 6–8 questions were asked:
         status = "Ready for next"
         if total >= 6:
+            # Map exact totals & scores to your labels
             if total == 6 and score == 5:
                 status = "Confident"
             elif total == 7 and score == 6:
@@ -523,24 +485,38 @@ class QuizManager:
             "status": status,
         }
 
+
 QUIZ = QuizManager()
 
+
+# =============================================================================
+# Quiz endpoints
+# =============================================================================
 @app.post("/quiz/start")
 def quiz_start(payload: Dict[str, Any] = Body(...)):
-    subject = str(payload.get("subject") or "LA")
-    topic   = str(payload.get("topic") or "1.1")
+    """
+    Body: { "subject": "LA"|"Stats", "topic": "1.1_Intro_to_..." }
+    """
     try:
+        subject = str(payload.get("subject") or "LA")
+        topic   = str(payload.get("topic") or "1.1")
         return QUIZ.start(subject=subject, topic=topic)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not start quiz: {e}")
 
+
 @app.post("/quiz/answer")
 def quiz_answer(payload: Dict[str, Any] = Body(...)):
-    session_id = str(payload.get("session_id") or "")
-    answer     = payload.get("answer")
-    if answer is None:
-        raise HTTPException(status_code=422, detail="Missing 'answer'")
+    """
+    Body: { "session_id": "...", "answer": 0|1|2|3 }
+    """
     try:
-        return QUIZ.answer(session_id=session_id, answer_index=int(answer))
+        session_id = str(payload.get("session_id") or "")
+        if not session_id:
+            raise ValueError("Missing 'session_id'")
+        if "answer" not in payload:
+            raise ValueError("Missing 'answer'")
+        answer = int(payload["answer"])
+        return QUIZ.answer(session_id=session_id, answer_index=answer)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not submit answer: {e}")
