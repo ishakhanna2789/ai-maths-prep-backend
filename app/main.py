@@ -78,7 +78,8 @@ def tutorials_file(subject: str, filename: str):
 
 # =============================================================================
 # =============================================================================
-# Quiz Engine (Excel-backed via openpyxl, adaptive — FIXED PHASE-2 FINISH)
+# =============================================================================
+# Quiz Engine (Excel-backed, step-based, deterministic finish)
 # =============================================================================
 from pydantic import BaseModel
 import uuid
@@ -96,9 +97,7 @@ _SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 def _sheet_key(topic: str) -> str:
     m = re.search(r"(\d+)\.(\d+)", topic or "")
-    if m:
-        return f"{int(m.group(1))}.{int(m.group(2))}"
-    return str(topic or "").strip()
+    return f"{int(m.group(1))}.{int(m.group(2))}" if m else str(topic or "").strip()
 
 def _load_questions(subject: str, sheet: str) -> List[Dict[str, Any]]:
     xlsx = QUIZZES_DIR / f"{subject}.xlsx"
@@ -110,8 +109,8 @@ def _load_questions(subject: str, sheet: str) -> List[Dict[str, Any]]:
         wb.close()
         raise HTTPException(status_code=400, detail=f"Sheet '{sheet}' missing in {xlsx.name}; have: {avail}")
     ws = wb[sheet]
-    header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
-    cols = { (str(c).strip().lower() if c else ""): i for i, c in enumerate(header) }
+    hdr = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    cols = {(str(c).strip().lower() if c else ""): i for i, c in enumerate(hdr)}
     need = ["question text","option a","option b","option c","option d","correct answer","difficulty"]
     miss = [c for c in need if c not in cols]
     if miss:
@@ -142,108 +141,115 @@ def _load_questions(subject: str, sheet: str) -> List[Dict[str, Any]]:
         raise HTTPException(status_code=400, detail="No questions found")
     return out
 
-def _pick(questions: List[Dict[str,Any]], want: str, used: set) -> Dict[str,Any]:
-    pool = [ (i,q) for i,q in enumerate(questions) if q["difficulty"]==want and i not in used ]
-    if not pool:
-        # fallback: any unused
-        pool = [ (i,q) for i,q in enumerate(questions) if i not in used ]
-        if not pool:
-            raise HTTPException(status_code=400, detail="Question bank exhausted")
-    i,q = pool[0]  # deterministic
-    used.add(i)
-    return {**q, "index": i}
+def _pop_from_pool(pools: Dict[str, List[Dict[str,Any]]], want: str) -> Dict[str,Any]:
+    # pop from preferred pool, else fall back to any non-empty pool
+    want = want.lower()
+    order = {"hard":["hard","medium","easy"], "medium":["medium","easy","hard"], "easy":["easy","medium","hard"]}[want]
+    for d in order:
+        if pools[d]:
+            return pools[d].pop(0)
+    raise HTTPException(status_code=400, detail="Question bank exhausted")
+
+def _status_after_phase1(score5: int) -> str:
+    return "Ready for next" if score5 >= 3 else "Review & retry"
+
+def _status_after_phase2(total: int, score: int) -> str:
+    if total == 6 and score == 5: return "Confident"
+    if total == 7 and score == 6: return "Proficient"
+    if total == 8 and score == 7: return "Master"
+    if total == 8 and score == 8: return "Champion"
+    return "Great progress"
 
 @app.post("/quiz/start")
 def quiz_start(req: QuizStart):
     sheet = _sheet_key(req.topic)
-    qs = _load_questions(req.subject, sheet)
+    all_qs = _load_questions(req.subject, sheet)
+    # Build FIFO pools so we never repeat a question
+    pools = {"easy":[], "medium":[], "hard":[]}
+    for q in all_qs:
+        pools[q["difficulty"]].append(q)
+
     sid = str(uuid.uuid4())
     _SESSIONS[sid] = {
-        "subject": req.subject,
-        "sheet": sheet,
-        "qs": qs,
-        "used": set(),
-        "phase": "p1",       # p1 -> p2
-        "p1_asked": 0,
-        "p1_correct": 0,
-        "p2_asked": 0,       # 0..2 (Q6, Q7, Q8)
-        "score": 0,
-        "asked": 0,
-        "last_correct": None,
-        "current": None
+        # immutable info
+        "subject": req.subject, "sheet": sheet, "pools": pools,
+        # progress
+        "step": 1,             # absolute step 1..8
+        "score": 0,            # total correct so far
+        "p1_correct": 0,       # correct among first 5
+        "q6_correct": None,    # correctness of Q6
+        "q7_correct": None,    # correctness of Q7
+        # current question
+        "current": None,
     }
-    # Q1: start easy
-    q = _pick(qs, "easy", _SESSIONS[sid]["used"])
+    # Step 1 difficulty: Easy
+    q = _pop_from_pool(pools, "easy")
     _SESSIONS[sid]["current"] = q
-    return {"session_id": sid, "question": {"text": q["text"], "options": q["options"], "difficulty": q["difficulty"]}}
+    return {"session_id": sid,
+            "question": {"text": q["text"], "options": q["options"], "difficulty": q["difficulty"]},
+            "done": False}
 
 @app.post("/quiz/answer")
 def quiz_answer(req: QuizAnswer):
     s = _SESSIONS.get(req.session_id)
-    if not s:
-        raise HTTPException(status_code=400, detail="Invalid session_id")
-    q = s["current"]
-    if not q:
-        raise HTTPException(status_code=400, detail="No current question")
+    if not s: raise HTTPException(status_code=400, detail="Invalid session_id")
+    q = s.get("current")
+    if not q: raise HTTPException(status_code=400, detail="No current question")
 
-    # grade
-    corr = (int(req.answer) == int(q["correct"]))
-    if corr: s["score"] += 1
-    s["asked"] += 1
-    s["last_correct"] = corr
+    # grade this step
+    correct = (int(req.answer) == int(q["correct"]))
+    if correct: s["score"] += 1
 
-    # ---------- PHASE 1 (first 5) ----------
-    if s["phase"] == "p1":
-        s["p1_asked"] += 1
-        if corr: s["p1_correct"] += 1
-
-        if s["p1_asked"] < 5:
-            # Serve next easy/medium (easier first 2, then medium)
-            next_diff = "easy" if s["p1_asked"] <= 2 else "medium"
-            nq = _pick(s["qs"], next_diff, s["used"])
+    # --- If in steps 1..5 (Phase 1) ---
+    if 1 <= s["step"] <= 5:
+        if correct: s["p1_correct"] += 1
+        s["step"] += 1
+        if s["step"] <= 5:
+            # next P1 difficulty: step 2 -> Easy, steps 3..5 -> Medium
+            next_diff = "easy" if s["step"] <= 2 else "medium"
+            nq = _pop_from_pool(s["pools"], next_diff)
             s["current"] = nq
-            return {"correct": corr, "done": False,
+            return {"correct": correct, "done": False,
                     "question": {"text": nq["text"], "options": nq["options"], "difficulty": nq["difficulty"]}}
-
-        # Completed 5
+        # completed 5
         if s["p1_correct"] < 5:
-            unlock = s["p1_correct"] >= 3
+            unlock = (s["p1_correct"] >= 3)
             s["current"] = None
-            return {"correct": corr, "done": True, "total": s["asked"], "score": s["score"],
-                    "unlock_next": unlock, "status": ("Ready for next" if unlock else "Review & retry")}
-
-        # perfect -> phase 2
-        s["phase"] = "p2"; s["p2_asked"] = 0
-        nq = _pick(s["qs"], "hard", s["used"])  # Q6 hard
+            return {"correct": correct, "done": True,
+                    "total": 5, "score": s["score"],
+                    "unlock_next": unlock,
+                    "status": _status_after_phase1(s["p1_correct"])}
+        # perfect 5 → go to step 6
+        s["step"] = 6
+        nq = _pop_from_pool(s["pools"], "hard")   # Q6 Hard
         s["current"] = nq
-        return {"correct": corr, "done": False,
+        return {"correct": correct, "done": False,
                 "question": {"text": nq["text"], "options": nq["options"], "difficulty": nq["difficulty"]}}
 
-    # ---------- PHASE 2 (Q6..Q8) ----------
-    s["p2_asked"] += 1  # just answered Q6/Q7/Q8?
+    # --- Steps 6..8 (Phase 2) ---
+    if s["step"] == 6:
+        s["q6_correct"] = correct
+        s["step"] = 7
+        next_diff = "hard" if correct else "medium"   # Q7
+        nq = _pop_from_pool(s["pools"], next_diff)
+        s["current"] = nq
+        return {"correct": correct, "done": False,
+                "question": {"text": nq["text"], "options": nq["options"], "difficulty": nq["difficulty"]}}
 
-    if s["p2_asked"] >= 3:
-        # finished after Q8
-        s["current"] = None
-        total, score = s["asked"], s["score"]
-        # status map
-        if total == 6 and score == 5: status = "Confident"
-        elif total == 7 and score == 6: status = "Proficient"
-        elif total == 8 and score == 7: status = "Master"
-        elif total == 8 and score == 8: status = "Champion"
-        else: status = "Great progress"
-        return {"correct": corr, "done": True, "total": total, "score": score,
-                "unlock_next": True, "status": status}
+    if s["step"] == 7:
+        s["q7_correct"] = correct
+        s["step"] = 8
+        next_diff = "hard" if correct else "easy"     # Q8
+        nq = _pop_from_pool(s["pools"], next_diff)
+        s["current"] = nq
+        return {"correct": correct, "done": False,
+                "question": {"text": nq["text"], "options": nq["options"], "difficulty": nq["difficulty"]}}
 
-    # pick next difficulty
-    if s["p2_asked"] == 1:
-        # we just answered Q6 -> choose Q7
-        next_diff = "hard" if corr else "medium"
-    else:
-        # we just answered Q7 -> choose Q8
-        next_diff = "hard" if corr else "easy"
-
-    nq = _pick(s["qs"], next_diff, s["used"])
-    s["current"] = nq
-    return {"correct": corr, "done": False,
-            "question": {"text": nq["text"], "options": nq["options"], "difficulty": nq["difficulty"]}}
+    # s["step"] == 8  → this answer finishes the quiz
+    s["step"] = 9
+    s["current"] = None
+    total = 8
+    status = _status_after_phase2(total, s["score"])
+    return {"correct": correct, "done": True,
+            "total": total, "score": s["score"],
+            "unlock_next": True, "status": status}
