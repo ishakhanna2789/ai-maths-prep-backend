@@ -77,446 +77,173 @@ def tutorials_file(subject: str, filename: str):
 
 
 # =============================================================================
-# Quiz Engine (Excel-backed via openpyxl, adaptive)
 # =============================================================================
-class QuizManager:
-    """
-    Adaptive quiz logic:
+# Quiz Engine (Excel-backed via openpyxl, adaptive — FIXED PHASE-2 FINISH)
+# =============================================================================
+from pydantic import BaseModel
+import uuid
 
-    Phase 1 (Q1–Q5): draw 5 questions from Easy/Medium only (column 'Difficulty').
-      - If correct >= 3 -> unlock_next = True and finish with status "Ready for next".
-      - If correct == 5 -> unlock_next = True and seamlessly continue to Phase 2.
+class QuizStart(BaseModel):
+    subject: str   # "LA" | "Stats"
+    topic: str     # "1.1" or "1.1_Intro_to_Vectors"
 
-    Phase 2 (Q6–Q8): only when Phase 1 is perfect (5/5)
-      - Q6 difficulty = Hard
-      - Q7 difficulty = Hard if Q6 correct else Medium
-      - Q8 difficulty = Hard if Q7 correct else Easy
+class QuizAnswer(BaseModel):
+    session_id: str
+    answer: int    # 0..3
 
-    Final statuses (when 6–8 asked):
-      - 5/6 -> "Confident"
-      - 6/7 -> "Proficient"
-      - 7/8 -> "Master"
-      - 8/8 -> "Champion"
-    """
+# In-memory sessions (MVP)
+_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-    def __init__(self) -> None:
-        # cache[subject][sheet_key] -> list of question dicts
-        self.cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-        # sessions[session_id] -> session state
-        self.sessions: Dict[str, Dict[str, Any]] = {}
+def _sheet_key(topic: str) -> str:
+    m = re.search(r"(\d+)\.(\d+)", topic or "")
+    if m:
+        return f"{int(m.group(1))}.{int(m.group(2))}"
+    return str(topic or "").strip()
 
-    # ----------------- Loading helpers -----------------
-    def _xlsx_path(self, subject: str) -> Path:
-        s = subject.strip()
-        if s not in {"LA", "Stats"}:
-            raise ValueError("Invalid subject (use 'LA' or 'Stats')")
-        return QUIZZES_DIR / f"{s}.xlsx"
-
-    def _sheet_key_from_topic(self, topic: str) -> str:
-        """
-        Extract the sheet key (e.g., '1.1') from a topic like '1.1_Intro_to_Vectors'.
-        """
-        m = re.search(r"(\d+)\.(\d+)", str(topic))
-        if m:
-            return f"{int(m.group(1))}.{int(m.group(2))}"
-        m2 = re.search(r"(\d+)", str(topic))
-        if m2:
-            return str(int(m2.group(1)))
-        raise ValueError("Cannot infer sheet key from topic")
-
-    def _idx_from_correct(self, raw: Any, options: List[str]) -> int:
-        """
-        Accept 'A'/'B'/'C'/'D' (case-insensitive), 0..3, or exact option text.
-        """
-        if raw is None:
-            return 0
+def _load_questions(subject: str, sheet: str) -> List[Dict[str, Any]]:
+    xlsx = QUIZZES_DIR / f"{subject}.xlsx"
+    if not xlsx.exists():
+        raise HTTPException(status_code=400, detail=f"Workbook not found: {xlsx}")
+    wb = load_workbook(filename=str(xlsx), read_only=True, data_only=True)
+    if sheet not in wb.sheetnames:
+        avail = ", ".join(wb.sheetnames)
+        wb.close()
+        raise HTTPException(status_code=400, detail=f"Sheet '{sheet}' missing in {xlsx.name}; have: {avail}")
+    ws = wb[sheet]
+    header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    cols = { (str(c).strip().lower() if c else ""): i for i, c in enumerate(header) }
+    need = ["question text","option a","option b","option c","option d","correct answer","difficulty"]
+    miss = [c for c in need if c not in cols]
+    if miss:
+        wb.close()
+        raise HTTPException(status_code=400, detail=f"Missing columns {miss} in sheet '{sheet}'")
+    def cidx(raw, options):
+        if raw is None: return 0
         s = str(raw).strip()
         if s.isdigit():
-            i = int(s)
-            if 0 <= i <= 3:
-                return i
-        letter_map = {"A": 0, "B": 1, "C": 2, "D": 3}
-        if s.upper() in letter_map:
-            return letter_map[s.upper()]
-        for i, opt in enumerate(options):
-            if s == opt:
-                return i
+            i = int(s);  return i if 0 <= i <= 3 else 0
+        L = {"A":0,"B":1,"C":2,"D":3}
+        if s.upper() in L: return L[s.upper()]
+        for i,o in enumerate(options):
+            if s == str(o): return i
         return 0
+    out = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        qtext = row[cols["question text"]]
+        if not qtext: continue
+        opts = [row[cols["option a"]], row[cols["option b"]], row[cols["option c"]], row[cols["option d"]]]
+        opts = ["" if o is None else str(o) for o in opts]
+        corr = cidx(row[cols["correct answer"]], opts)
+        diff = str(row[cols["difficulty"]] or "").strip().lower()
+        diff = "easy" if diff.startswith("e") else "medium" if diff.startswith("m") else "hard"
+        out.append({"text": str(qtext), "options": opts, "correct": corr, "difficulty": diff})
+    wb.close()
+    if not out:
+        raise HTTPException(status_code=400, detail="No questions found")
+    return out
 
-    def _load_sheet(self, subject: str, sheet_key: str) -> List[Dict[str, Any]]:
-        """
-        Read a sheet using openpyxl.
-        Required headers (case-insensitive):
-            Question Text | Option A | Option B | Option C | Option D | Correct Answer | Difficulty
-        Optional:
-            Module | Question ID | Question Type | Hint | Explanation | Tags | Image Link (optional)
-        """
-        subj_cache = self.cache.setdefault(subject, {})
-        if sheet_key in subj_cache:
-            return subj_cache[sheet_key]
+def _pick(questions: List[Dict[str,Any]], want: str, used: set) -> Dict[str,Any]:
+    pool = [ (i,q) for i,q in enumerate(questions) if q["difficulty"]==want and i not in used ]
+    if not pool:
+        # fallback: any unused
+        pool = [ (i,q) for i,q in enumerate(questions) if i not in used ]
+        if not pool:
+            raise HTTPException(status_code=400, detail="Question bank exhausted")
+    i,q = pool[0]  # deterministic
+    used.add(i)
+    return {**q, "index": i}
 
-        xlsx = self._xlsx_path(subject)
-        if not xlsx.exists():
-            raise FileNotFoundError(f"Quiz workbook missing: {xlsx}")
-
-        try:
-            wb = load_workbook(filename=str(xlsx), read_only=True, data_only=True)
-        except Exception as e:
-            raise FileNotFoundError(f"Cannot open workbook {xlsx.name}: {e}")
-
-        if sheet_key not in wb.sheetnames:
-            wb.close()
-            raise FileNotFoundError(f"Sheet '{sheet_key}' missing in {xlsx.name}")
-
-        ws = wb[sheet_key]
-
-        # Header row
-        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-        if not header_row:
-            wb.close()
-            raise ValueError(f"No header in sheet '{sheet_key}' of {xlsx.name}")
-
-        headers = [str(c).strip().lower() if c is not None else "" for c in header_row]
-        col_index = {h: i for i, h in enumerate(headers)}
-
-        # Validate required columns
-        required = [
-            "question text", "option a", "option b", "option c",
-            "option d", "correct answer", "difficulty"
-        ]
-        missing = [c for c in required if c not in col_index]
-        if missing:
-            wb.close()
-            raise ValueError(f"Missing columns {missing} in sheet '{sheet_key}' of {xlsx.name}")
-
-        # Optional columns map
-        optional_map = {
-            "hint": "hint",
-            "explanation": "explanation",
-            "image_url": "image link (optional)",
-            "qid": "question id",
-            "module": "module",
-            "tags": "tags",
-            "type": "question type",
-        }
-
-        # Rows -> questions
-        items: List[Dict[str, Any]] = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            def cell(col_name: str) -> Any:
-                i = col_index.get(col_name)
-                return row[i] if i is not None and i < len(row) else None
-
-            qtext = cell("question text")
-            if qtext is None or str(qtext).strip() == "":
-                continue  # skip empty rows
-
-            options = [
-                "" if cell("option a") is None else str(cell("option a")),
-                "" if cell("option b") is None else str(cell("option b")),
-                "" if cell("option c") is None else str(cell("option c")),
-                "" if cell("option d") is None else str(cell("option d")),
-            ]
-            correct = self._idx_from_correct(cell("correct answer"), options)
-
-            diff_raw = str(cell("difficulty") or "").strip().lower()
-            if diff_raw.startswith("e"):
-                diff = "easy"
-            elif diff_raw.startswith("m"):
-                diff = "medium"
-            elif diff_raw.startswith("h"):
-                diff = "hard"
-            else:
-                diff = "medium"
-
-            item: Dict[str, Any] = {
-                "text": str(qtext),
-                "options": options,
-                "correct_index": correct,
-                "difficulty": diff,
-            }
-
-            # Attach optional metadata if present
-            for k, col_name in optional_map.items():
-                i = col_index.get(col_name)
-                if i is not None and i < len(row) and row[i] is not None:
-                    item[k] = str(row[i])
-
-            items.append(item)
-
-        wb.close()
-
-        if not items:
-            raise ValueError(f"No questions in sheet '{sheet_key}' of {xlsx.name}")
-
-        subj_cache[sheet_key] = items
-        return items
-
-    # ----------------- Pool & selection helpers -----------------
-    def _split_pools(self, items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-        pools = {"easy": [], "medium": [], "hard": []}
-        for it in items:
-            pools.get(it.get("difficulty", "medium"), pools["medium"]).append(it)
-        return pools
-
-    def _draw(self, pool: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
-        if k <= 0:
-            return []
-        if len(pool) <= k:
-            return random.sample(pool, len(pool)) if pool else []
-        return random.sample(pool, k)
-
-    def _fallback_take(self, pools: Dict[str, List[Dict[str, Any]]], wanted: List[str], k: int) -> List[Dict[str, Any]]:
-        """
-        Take up to k from pools in order of 'wanted' difficulties; if short, fill from any available.
-        """
-        chosen: List[Dict[str, Any]] = []
-        for name in wanted:
-            take = min(k - len(chosen), len(pools.get(name, [])))
-            if take > 0:
-                chosen.extend(self._draw(pools[name], take))
-        if len(chosen) < k:
-            # Fill from all (avoid duplicates)
-            all_pool = [x for arr in pools.values() for x in arr if x not in chosen]
-            chosen.extend(self._draw(all_pool, k - len(chosen)))
-        return chosen[:k]
-
-    # ----------------- Public API -----------------
-    def start(self, subject: str, topic: str) -> Dict[str, Any]:
-        """
-        Initialize a session with 5 questions (Easy/Medium). If perfect 5/5,
-        the session will continue into adaptive Phase 2 (Q6–Q8).
-        """
-        sheet_key = self._sheet_key_from_topic(topic)
-        all_items = self._load_sheet(subject, sheet_key)
-        pools = self._split_pools(all_items)
-
-        first5 = self._fallback_take(pools, ["easy", "medium"], 5)
-        if not first5:
-            raise ValueError("No questions available for Phase 1")
-
-        sid = str(uuid.uuid4())
-        self.sessions[sid] = {
-            "subject": subject,
-            "topic": topic,
-            "sheet_key": sheet_key,
-            "phase": 1,           # 1 or 2
-            "index": 0,           # index within current phase
-            "first5": first5,
-            "first5_correct": 0,
-            "pools": pools,
-            "score": 0,
-            "asked": 0,
-            "unlock_next": False, # set True if >=3/5 in Phase 1
-            "q6_result": None,    # set in Phase 2
-            "q7_result": None,    # set in Phase 2
-            "adaptive": [],       # questions for Phase 2
-        }
-
-        q = first5[0]
-        return {
-            "session_id": sid,
-            "question": {"text": q["text"], "options": q["options"], "difficulty": q["difficulty"]},
-            "done": False,
-        }
-
-    def _select_adaptive_seq(self, pools: Dict[str, List[Dict[str, Any]]], q6_correct: bool, q7_correct: Optional[bool]) -> List[Dict[str, Any]]:
-        """
-        Build the desired sequence Q6..Q8 with the specified branching rules,
-        using safe fallbacks if a difficulty pool is short.
-        """
-        desired = [
-            "hard",                                   # Q6
-            "hard" if q6_correct else "medium",       # Q7
-            "hard" if (q7_correct is True) else ("easy" if (q7_correct is False) else "medium"),  # Q8
-        ]
-
-        chosen: List[Dict[str, Any]] = []
-        for want in desired:
-            order = {
-                "hard":   ["hard", "medium", "easy"],
-                "medium": ["medium", "easy", "hard"],
-                "easy":   ["easy", "medium", "hard"],
-            }[want]
-            pick = self._fallback_take(pools, order, 1)
-            if pick:
-                # avoid duplicates across adaptive picks
-                ids = set(id(x) for x in chosen)
-                p = next((x for x in pick if id(x) not in ids), None)
-                if p is not None:
-                    chosen.append(p)
-        return chosen
-
-    def answer(self, session_id: str, answer_index: int) -> Dict[str, Any]:
-        sess = self.sessions.get(session_id)
-        if not sess:
-            raise ValueError("Invalid session_id")
-
-        # ---------------- Phase 1 ----------------
-        if sess["phase"] == 1:
-            i = sess["index"]
-            curr = sess["first5"][i]
-            correct = (int(answer_index) == int(curr["correct_index"]))
-            if correct:
-                sess["first5_correct"] += 1
-                sess["score"] += 1
-            sess["asked"] += 1
-
-            if i < 4:
-                # Next question within Phase 1
-                sess["index"] += 1
-                nxt = sess["first5"][sess["index"]]
-                return {
-                    "correct": correct,
-                    "done": False,
-                    "question": {"text": nxt["text"], "options": nxt["options"], "difficulty": nxt["difficulty"]},
-                }
-
-            # Completed first 5
-            passed = (sess["first5_correct"] >= 3)
-            sess["unlock_next"] = passed
-
-            if sess["first5_correct"] < 5:
-                # End here (not perfect): show "Ready for next" if passed
-                return {
-                    "correct": correct,
-                    "done": True,
-                    "score": sess["score"],
-                    "total": sess["asked"],
-                    "unlock_next": passed,
-                    "status": "Ready for next" if passed else "Review & retry",
-                }
-
-            # Perfect 5 → continue to Phase 2 (adaptive)
-            pools = sess["pools"]
-            adaptive = self._select_adaptive_seq(pools, q6_correct=True, q7_correct=None)
-            if not adaptive:
-                # If somehow nothing available, still end gracefully
-                return {
-                    "correct": correct,
-                    "done": True,
-                    "score": sess["score"],
-                    "total": sess["asked"],
-                    "unlock_next": True,
-                    "status": "Ready for next",
-                }
-
-            sess["phase"] = 2
-            sess["index"] = 0
-            sess["adaptive"] = adaptive
-            nxt = adaptive[0]  # Q6
-            return {
-                "correct": correct,
-                "done": False,
-                "question": {"text": nxt["text"], "options": nxt["options"], "difficulty": nxt.get("difficulty", "hard")},
-            }
-
-        # ---------------- Phase 2 ----------------
-        i = sess["index"]
-        curr = sess["adaptive"][i]
-        correct = (int(answer_index) == int(curr["correct_index"]))
-        if correct:
-            sess["score"] += 1
-        sess["asked"] += 1
-
-        if i == 0:
-            # After Q6 → decide Q7 difficulty
-            sess["q6_result"] = correct
-            pools = sess["pools"]
-            rem = self._select_adaptive_seq(pools, q6_correct=correct, q7_correct=None)
-            # Keep the next 2 (Q7, Q8)
-            sess["adaptive"] = rem[:2] if len(rem) >= 2 else rem
-            sess["index"] = 0
-            if sess["adaptive"]:
-                nxt = sess["adaptive"][0]  # Q7
-                return {
-                    "correct": correct,
-                    "done": False,
-                    "question": {"text": nxt["text"], "options": nxt["options"], "difficulty": nxt.get("difficulty", "medium")},
-                }
-            return self._finish(sess, correct)
-
-        if i == 1:
-            # After Q7 → decide Q8 difficulty
-            sess["q7_result"] = correct
-            pools = sess["pools"]
-            q8 = self._select_adaptive_seq(pools, q6_correct=bool(sess["q6_result"]), q7_correct=correct)
-            sess["adaptive"] = q8[:1] if q8 else []
-            sess["index"] = 0
-            if sess["adaptive"]:
-                nxt = sess["adaptive"][0]  # Q8
-                return {
-                    "correct": correct,
-                    "done": False,
-                    "question": {"text": nxt["text"], "options": nxt["options"], "difficulty": nxt.get("difficulty", "easy")},
-                }
-            return self._finish(sess, correct)
-
-        # i == 0 for final Q8 (due to resets above)
-        return self._finish(sess, correct)
-
-    def _finish(self, sess: Dict[str, Any], last_correct: bool) -> Dict[str, Any]:
-        total = sess["asked"]
-        score = sess["score"]
-        # If we reached Phase 2, unlock_next is inherently True (Phase 1 was perfect)
-        unlock = sess.get("unlock_next", False) or True
-
-        # Status decisions when 6–8 questions were asked:
-        status = "Ready for next"
-        if total >= 6:
-            # Map exact totals & scores to your labels
-            if total == 6 and score == 5:
-                status = "Confident"
-            elif total == 7 and score == 6:
-                status = "Proficient"
-            elif total == 8 and score == 7:
-                status = "Master"
-            elif total == 8 and score == 8:
-                status = "Champion"
-            else:
-                status = "Great progress"
-
-        return {
-            "correct": last_correct,
-            "done": True,
-            "score": score,
-            "total": total,
-            "unlock_next": unlock,
-            "status": status,
-        }
-
-
-QUIZ = QuizManager()
-
-
-# =============================================================================
-# Quiz endpoints
-# =============================================================================
 @app.post("/quiz/start")
-def quiz_start(payload: Dict[str, Any] = Body(...)):
-    """
-    Body: { "subject": "LA"|"Stats", "topic": "1.1_Intro_to_..." }
-    """
-    try:
-        subject = str(payload.get("subject") or "LA")
-        topic   = str(payload.get("topic") or "1.1")
-        return QUIZ.start(subject=subject, topic=topic)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not start quiz: {e}")
-
+def quiz_start(req: QuizStart):
+    sheet = _sheet_key(req.topic)
+    qs = _load_questions(req.subject, sheet)
+    sid = str(uuid.uuid4())
+    _SESSIONS[sid] = {
+        "subject": req.subject,
+        "sheet": sheet,
+        "qs": qs,
+        "used": set(),
+        "phase": "p1",       # p1 -> p2
+        "p1_asked": 0,
+        "p1_correct": 0,
+        "p2_asked": 0,       # 0..2 (Q6, Q7, Q8)
+        "score": 0,
+        "asked": 0,
+        "last_correct": None,
+        "current": None
+    }
+    # Q1: start easy
+    q = _pick(qs, "easy", _SESSIONS[sid]["used"])
+    _SESSIONS[sid]["current"] = q
+    return {"session_id": sid, "question": {"text": q["text"], "options": q["options"], "difficulty": q["difficulty"]}}
 
 @app.post("/quiz/answer")
-def quiz_answer(payload: Dict[str, Any] = Body(...)):
-    """
-    Body: { "session_id": "...", "answer": 0|1|2|3 }
-    """
-    try:
-        session_id = str(payload.get("session_id") or "")
-        if not session_id:
-            raise ValueError("Missing 'session_id'")
-        if "answer" not in payload:
-            raise ValueError("Missing 'answer'")
-        answer = int(payload["answer"])
-        return QUIZ.answer(session_id=session_id, answer_index=answer)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not submit answer: {e}")
+def quiz_answer(req: QuizAnswer):
+    s = _SESSIONS.get(req.session_id)
+    if not s:
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+    q = s["current"]
+    if not q:
+        raise HTTPException(status_code=400, detail="No current question")
+
+    # grade
+    corr = (int(req.answer) == int(q["correct"]))
+    if corr: s["score"] += 1
+    s["asked"] += 1
+    s["last_correct"] = corr
+
+    # ---------- PHASE 1 (first 5) ----------
+    if s["phase"] == "p1":
+        s["p1_asked"] += 1
+        if corr: s["p1_correct"] += 1
+
+        if s["p1_asked"] < 5:
+            # Serve next easy/medium (easier first 2, then medium)
+            next_diff = "easy" if s["p1_asked"] <= 2 else "medium"
+            nq = _pick(s["qs"], next_diff, s["used"])
+            s["current"] = nq
+            return {"correct": corr, "done": False,
+                    "question": {"text": nq["text"], "options": nq["options"], "difficulty": nq["difficulty"]}}
+
+        # Completed 5
+        if s["p1_correct"] < 5:
+            unlock = s["p1_correct"] >= 3
+            s["current"] = None
+            return {"correct": corr, "done": True, "total": s["asked"], "score": s["score"],
+                    "unlock_next": unlock, "status": ("Ready for next" if unlock else "Review & retry")}
+
+        # perfect -> phase 2
+        s["phase"] = "p2"; s["p2_asked"] = 0
+        nq = _pick(s["qs"], "hard", s["used"])  # Q6 hard
+        s["current"] = nq
+        return {"correct": corr, "done": False,
+                "question": {"text": nq["text"], "options": nq["options"], "difficulty": nq["difficulty"]}}
+
+    # ---------- PHASE 2 (Q6..Q8) ----------
+    s["p2_asked"] += 1  # just answered Q6/Q7/Q8?
+
+    if s["p2_asked"] >= 3:
+        # finished after Q8
+        s["current"] = None
+        total, score = s["asked"], s["score"]
+        # status map
+        if total == 6 and score == 5: status = "Confident"
+        elif total == 7 and score == 6: status = "Proficient"
+        elif total == 8 and score == 7: status = "Master"
+        elif total == 8 and score == 8: status = "Champion"
+        else: status = "Great progress"
+        return {"correct": corr, "done": True, "total": total, "score": score,
+                "unlock_next": True, "status": status}
+
+    # pick next difficulty
+    if s["p2_asked"] == 1:
+        # we just answered Q6 -> choose Q7
+        next_diff = "hard" if corr else "medium"
+    else:
+        # we just answered Q7 -> choose Q8
+        next_diff = "hard" if corr else "easy"
+
+    nq = _pick(s["qs"], next_diff, s["used"])
+    s["current"] = nq
+    return {"correct": corr, "done": False,
+            "question": {"text": nq["text"], "options": nq["options"], "difficulty": nq["difficulty"]}}
