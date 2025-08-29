@@ -3,3 +3,7 @@ uvicorn==0.30.6
 python-multipart==0.0.9
 requests==2.32.3
 openpyxl==3.1.5
+openpyxl>=3.1.2
+pydantic
+fastapi
+uvicorn
