@@ -29,7 +29,8 @@ TUTORIALS_DIR = APP_DIR / "data" / "tutorials"
 QUIZZES_DIR   = APP_DIR / "data" / "quizzes"
 
 # Serve tutorials as static files (so Streamlit can embed PDFs reliably)
-app.mount("/static/tutorials", StaticFiles(directory=str(TUTORIALS_DIR)), name="tutorials")
+app.mount("/static", StaticFiles(directory="app/data"), name="static")
+
 
 
 # =============================================================================
@@ -64,15 +65,10 @@ def tutorials_list(subject: str):
 
 @app.get("/tutorials_file")
 def tutorials_file(subject: str, filename: str):
-    """
-    Return a JSON object with a public URL to the tutorial file.
-    The frontend will embed this, and also has a static fallback.
-    """
     subject_dir = TUTORIALS_DIR / subject
     file_path = subject_dir / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Tutorial file not found")
-    # Return a relative API URL (frontend can prefix with API_BASE_URL)
     return {"url": f"/static/tutorials/{subject}/{filename}"}
 
 
