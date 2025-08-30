@@ -29,7 +29,8 @@ TUTORIALS_DIR = APP_DIR / "data" / "tutorials"
 QUIZZES_DIR   = APP_DIR / "data" / "quizzes"
 
 # Serve tutorials as static files (so Streamlit can embed PDFs reliably)
-app.mount("/static", StaticFiles(directory="app/data"), name="static")
+APP_DIR = Path(__file__).parent
+app.mount("/static", StaticFiles(directory=APP_DIR / "data"), name="static")
 
 
 
