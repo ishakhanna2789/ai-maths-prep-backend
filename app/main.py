@@ -5,7 +5,6 @@ from typing import Dict, List, Any
 from pathlib import Path
 import re, uuid
 from openpyxl import load_workbook
-from pydantic import BaseModel
 from pydantic import BaseModel, Field
 
 # =============================================================================
@@ -60,19 +59,9 @@ class QuizStart(BaseModel):
     subject: str = Field(..., example="LA")
     topic: str = Field(..., example="1.1")
 
-
 class QuizAnswer(BaseModel):
     session_id: str = Field(..., example="123e4567-e89b-12d3-a456-426614174000")
     answer: int = Field(..., example=2)
-
-    class Config:
-        schema_extra = {
-            "example": {
-                "session_id": "123e4567-e89b-12d3-a456-426614174000",
-                "answer": 2
-            }
-        }
-
 
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
 
@@ -93,16 +82,16 @@ def _load_questions(subject: str, sheet: str) -> List[Dict[str, Any]]:
 
     out = []
     for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row[idx["question text"]]: continue
-        opts = [row[idx["option a"]], row[idx["option b"]], row[idx["option c"]], row[idx["option d"]]]
-        opts = ["" if o is None else str(o) for o in opts]
+        qtext = str(row[idx["question text"]]).strip()
+        if not qtext: continue
+        opts = [str(row[idx["option a"]]), str(row[idx["option b"]]), str(row[idx["option c"]]), str(row[idx["option d"]])]
         corr = str(row[idx["correct answer"]]).strip().upper()
         corr_idx = {"A":0,"B":1,"C":2,"D":3}.get(corr, 0)
         diff = str(row[idx["difficulty"]] or "").lower()
         if diff.startswith("e"): diff="easy"
         elif diff.startswith("m"): diff="medium"
         else: diff="hard"
-        out.append({"text": row[idx["question text"]], "options": opts, "correct": corr_idx, "difficulty": diff})
+        out.append({"text": qtext, "options": opts, "correct": corr_idx, "difficulty": diff})
     wb.close()
     return out
 
@@ -163,6 +152,7 @@ def quiz_answer(req: QuizAnswer):
 
     if s["step"] == 5:
         if correct: s["p1_score"] += 1
+        # Evaluate phase 1 result
         if s["p1_score"] <= 2:
             return {"correct": correct, "done": True, "total": 5, "score": s["score"],
                     "unlock_next": False,
@@ -175,9 +165,9 @@ def quiz_answer(req: QuizAnswer):
                     "classification": _classification(s["score"])}
         # Perfect → continue Phase 2
         s["step"] = 6
-        nq = s["pools"]["hard"].pop(0)
+        nq = s["pools"]["hard"].pop(0) if s["pools"]["hard"] else s["pools"]["medium"].pop(0)
         s["current"] = nq
-        return {"correct": correct, "done": False, "question": {"text": nq["text"], "options": nq["options"]}}
+        return {"correct": correct, "done": False, "question": {"text": nq["text"], "options": nq["options"], "difficulty": nq["difficulty"]}}
 
     # ---------------- Phase 2 (Q6-Q12) ----------------
     if 6 <= s["step"] <= 12:
@@ -187,6 +177,6 @@ def quiz_answer(req: QuizAnswer):
                     "classification": _classification(s["score"])}
         s["step"] += 1
         next_diff = _shift(q["difficulty"], correct)
-        nq = s["pools"][next_diff].pop(0)
+        nq = s["pools"][next_diff].pop(0) if s["pools"][next_diff] else s["pools"]["medium"].pop(0)
         s["current"] = nq
-        return {"correct": correct, "done": False, "question": {"text": nq["text"], "options": nq["options"]}}
+        return {"correct": correct, "done": False, "question": {"text": nq["text"], "options": nq["options"], "difficulty": nq["difficulty"]}}
